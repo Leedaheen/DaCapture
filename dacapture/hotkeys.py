@@ -1,4 +1,10 @@
-"""전역 단축키 (RegisterHotKey + Qt 네이티브 이벤트 필터)."""
+"""전역 단축키 (RegisterHotKey + Qt 네이티브 이벤트 필터).
+
+Print Screen 은 Windows 가 RegisterHotKey 보다 먼저 처리해 WM_HOTKEY 가 오지 않으므로
+저수준 키보드 훅(WH_KEYBOARD_LL)으로 가로챈다.
+"""
+import ctypes
+import threading
 from ctypes import wintypes as wt
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QCoreApplication, Qt, QTimer
@@ -49,6 +55,102 @@ def seq_to_win(seq):
     return m, vk
 
 
+VK_SNAPSHOT = 0x2C
+_WH_KEYBOARD_LL = 13
+_WM_KEYDOWN, _WM_KEYUP, _WM_SYSKEYDOWN, _WM_SYSKEYUP = 0x0100, 0x0101, 0x0104, 0x0105
+
+
+class _KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", wt.DWORD), ("scanCode", wt.DWORD), ("flags", wt.DWORD), ("time", wt.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+_LRESULT = ctypes.c_ssize_t
+_HOOKPROC = ctypes.WINFUNCTYPE(_LRESULT, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+_u32 = ctypes.WinDLL("user32", use_last_error=True)
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_u32.SetWindowsHookExW.argtypes = [ctypes.c_int, _HOOKPROC, wt.HINSTANCE, wt.DWORD]
+_u32.SetWindowsHookExW.restype = wt.HHOOK
+_u32.CallNextHookEx.argtypes = [wt.HHOOK, ctypes.c_int, wt.WPARAM, wt.LPARAM]
+_u32.CallNextHookEx.restype = _LRESULT
+_u32.UnhookWindowsHookEx.argtypes = [wt.HHOOK]
+_u32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+_u32.GetAsyncKeyState.restype = ctypes.c_short
+_u32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+_u32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+_u32.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
+_k32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+_k32.GetModuleHandleW.restype = wt.HMODULE
+_WM_QUIT = 0x0012
+
+
+def _current_mods():
+    down = lambda vk: _u32.GetAsyncKeyState(vk) & 0x8000
+    m = 0
+    if down(0x11):
+        m |= winapi.MOD_CONTROL
+    if down(0x10):
+        m |= winapi.MOD_SHIFT
+    if down(0x12):
+        m |= winapi.MOD_ALT
+    if down(0x5B) or down(0x5C):
+        m |= winapi.MOD_WIN
+    return m
+
+
+class _PrintHook:
+    """별도 스레드에서 도는 저수준 키보드 훅. 메인 스레드가 캡처 준비로 바빠도 지연되지 않는다.
+    일치하는 Print Screen 조합을 누르면 sink 창으로 WM_HOTKEY(id) 를 보낸다."""
+
+    def __init__(self, hwnd, combos):
+        self.hwnd = hwnd
+        self.combos = dict(combos)  # {modifiers: hotkey id}
+        self.down = False
+        self.tid = 0
+        self.ok = False
+        self._proc = _HOOKPROC(self._ll_proc)  # GC 방지용 참조 유지
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="PrintHook", daemon=True)
+        self._thread.start()
+        self._ready.wait(2)
+
+    def _run(self):
+        self.tid = _k32.GetCurrentThreadId()
+        hook = _u32.SetWindowsHookExW(_WH_KEYBOARD_LL, self._proc, _k32.GetModuleHandleW(None), 0)
+        self.ok = bool(hook)
+        self._ready.set()
+        if not hook:
+            return
+        msg = wt.MSG()
+        while _u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            pass
+        _u32.UnhookWindowsHookEx(hook)
+
+    def stop(self):
+        if self.tid:
+            _u32.PostThreadMessageW(self.tid, _WM_QUIT, 0, 0)
+            self._thread.join(1)
+
+    def _ll_proc(self, code, wparam, lparam):
+        try:
+            if code == 0:
+                kb = _KBDLLHOOKSTRUCT.from_address(lparam)
+                if kb.vkCode == VK_SNAPSHOT:
+                    if wparam in (_WM_KEYDOWN, _WM_SYSKEYDOWN):
+                        hid = self.combos.get(_current_mods())
+                        if hid:
+                            if not self.down:  # 키 반복 무시
+                                self.down = True
+                                _u32.PostMessageW(self.hwnd, winapi.WM_HOTKEY, hid, 0)
+                            return 1  # Windows 기본 동작(클립보드 복사, 캡처 도구) 차단
+                    elif wparam in (_WM_KEYUP, _WM_SYSKEYUP) and self.down:
+                        self.down = False
+                        return 1
+        except Exception:
+            pass
+        return _u32.CallNextHookEx(None, code, wparam, lparam)
+
+
 class HotkeyManager(QAbstractNativeEventFilter):
     def __init__(self, callback):
         super().__init__()
@@ -56,25 +158,43 @@ class HotkeyManager(QAbstractNativeEventFilter):
         self._sink = QWidget()
         self._hwnd = int(self._sink.winId())
         self._ids = {}
+        self._registered = []   # RegisterHotKey 로 등록한 id
+        self._prt_hook = None
         QCoreApplication.instance().installNativeEventFilter(self)
 
     def unregister_all(self):
-        for hid in list(self._ids):
+        for hid in self._registered:
             winapi.user32.UnregisterHotKey(self._hwnd, hid)
+        self._registered.clear()
         self._ids.clear()
+        if self._prt_hook:
+            self._prt_hook.stop()
+            self._prt_hook = None
 
     def register_all(self, mapping):
         """mapping: {mode: 'Ctrl+Shift+C'} -> 등록 실패한 [(mode, seq)]"""
         self.unregister_all()
         failed = []
+        prt = {}  # {modifiers: (id, mode, seq)}
         for i, (mode, seq) in enumerate(mapping.items(), start=1):
             if not seq:
                 continue
             mv = seq_to_win(seq)
+            if mv and mv[1] == VK_SNAPSHOT:
+                prt[mv[0]] = (i, mode, seq)
+                continue
             if not mv or not winapi.user32.RegisterHotKey(self._hwnd, i, mv[0] | winapi.MOD_NOREPEAT, mv[1]):
                 failed.append((mode, seq))
                 continue
+            self._registered.append(i)
             self._ids[i] = mode
+        if prt:
+            hook = _PrintHook(self._hwnd, {m: v[0] for m, v in prt.items()})
+            if hook.ok:
+                self._prt_hook = hook
+                self._ids.update({i: mode for i, mode, _ in prt.values()})
+            else:
+                failed.extend((mode, seq) for _, mode, seq in prt.values())
         return failed
 
     def nativeEventFilter(self, event_type, message):
