@@ -21,7 +21,9 @@ from .settings_dialog import SettingsDialog
 SERVER_NAME = "DaCapture-single-instance"
 
 STYLE = """
-QMainWindow, QDialog { background: #F4F6FA; }
+QMainWindow, QDialog { background: #F4F6FA; color: #3D3D3D; }
+QLabel, QCheckBox, QRadioButton, QGroupBox { color: #3D3D3D; }
+QLineEdit, QSpinBox, QComboBox { color: #3D3D3D; }
 QToolBar { background: #FFFFFF; border: none; border-bottom: 1px solid #DCE1EA; spacing: 2px; padding: 3px; }
 QToolButton { border: 1px solid transparent; border-radius: 4px; padding: 3px; color: #3D3D3D; }
 QToolButton:hover { background: #E6ECF5; border-color: #C5D0E2; }
@@ -32,6 +34,9 @@ QToolButton#modeButton { background: #FFFFFF; border: 1px solid #DCE1EA; border-
     padding: 6px 2px; font-size: 12px; color: #1B365D; }
 QToolButton#modeButton:hover { background: #E6ECF5; border-color: #1B365D; }
 QToolButton#smallButton { color: #3D3D3D; }
+QToolButton#prtButton { background: #FFFFFF; border: 1px solid #C5D0E2; padding: 4px 18px 4px 8px; }
+QToolButton#prtButton:hover { background: #E6ECF5; border-color: #1B365D; }
+QToolButton#prtButton::menu-indicator { subcontrol-position: right center; right: 5px; }
 QLabel#title { color: #1B365D; font-size: 15px; font-weight: bold; }
 QLabel#hint { color: #6B7280; font-size: 11px; }
 QPushButton { background: #1B365D; color: white; border: none; border-radius: 4px; padding: 5px 14px; }
@@ -353,6 +358,11 @@ def main():
     font = QFont("Malgun Gothic")
     font.setPointSize(9)
     app.setFont(font)
+    # Windows 다크 모드에서도 밝은 테마 고정 (밝은 배경 + 흰 글자로 안 보이는 문제 방지)
+    try:
+        app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+    except AttributeError:
+        pass
     app.setStyleSheet(STYLE)
 
     args = [a for a in sys.argv[1:]]

@@ -1,14 +1,87 @@
 """환경 설정 대화상자."""
 import os
 
-from PySide6.QtGui import QKeySequence
+from PySide6.QtCore import QKeyCombination, Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-                               QGridLayout, QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit, QMessageBox,
-                               QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
+                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton,
+                               QSpinBox, QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
 from . import icons
 from .config import DEFAULT_HOTKEYS, MODE_NAMES, MODES, SAVE_FORMATS
 from .hotkeys import seq_to_win
+
+_MOD_KEYS = {Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta, Qt.Key.Key_AltGr}
+_MOD_MASK = (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier |
+             Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier)
+PRINT_PRESETS = ["Print", "Ctrl+Print", "Shift+Print", "Ctrl+Shift+Print"]
+
+
+def display_seq(seq):
+    """'Ctrl+Print' -> 'Ctrl+Print Screen'"""
+    if not seq:
+        return ""
+    return seq.replace("Print", "Print Screen") if seq.endswith("Print") else seq
+
+
+class HotkeyEdit(QLineEdit):
+    """단축키 입력란. Print Screen 처럼 Windows 가 key-up 만 보내는 키도 받는다."""
+
+    def __init__(self, seq=""):
+        super().__init__()
+        self.setReadOnly(True)
+        self.setPlaceholderText("여기를 클릭하고 키를 누르세요")
+        self._seq = ""
+        self.set_seq(seq)
+
+    def seq(self):
+        return self._seq
+
+    def set_seq(self, seq):
+        self._seq = seq or ""
+        self.setText(display_seq(self._seq))
+
+    def clear(self):
+        self.set_seq("")
+
+    @staticmethod
+    def _mods_text(mods):
+        names = ((Qt.KeyboardModifier.ControlModifier, "Ctrl"), (Qt.KeyboardModifier.ShiftModifier, "Shift"),
+                 (Qt.KeyboardModifier.AltModifier, "Alt"), (Qt.KeyboardModifier.MetaModifier, "Meta"))
+        return "+".join(n for f, n in names if mods & f)
+
+    def _commit(self, key, mods):
+        comb = QKeyCombination(Qt.KeyboardModifier(mods & _MOD_MASK), Qt.Key(key))
+        self.set_seq(QKeySequence(comb).toString(QKeySequence.SequenceFormat.PortableText))
+
+    def keyPressEvent(self, e):
+        key = e.key()
+        mods = e.modifiers()
+        if key in _MOD_KEYS:
+            t = self._mods_text(mods)
+            self.setText(t + "+" if t else "")
+            return
+        if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete, Qt.Key.Key_Escape) and not (mods & _MOD_MASK):
+            self.clear()
+            return
+        vk = e.nativeVirtualKey()
+        if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:  # Shift+숫자 등 기호로 바뀐 키를 원래 키로
+            key = vk
+        if key in (0, Qt.Key.Key_unknown):
+            return
+        self._commit(key, mods)
+
+    def keyReleaseEvent(self, e):
+        if e.key() == Qt.Key.Key_Print:  # Windows 는 Print Screen 의 key-down 을 보내지 않음
+            self._commit(Qt.Key.Key_Print, e.modifiers())
+            return
+        if e.key() in _MOD_KEYS and self.text().endswith("+"):
+            self.set_seq(self._seq)
+        super().keyReleaseEvent(e)
+
+    def focusOutEvent(self, e):
+        self.set_seq(self._seq)
+        super().focusOutEvent(e)
 
 
 class SettingsDialog(QDialog):
@@ -61,25 +134,48 @@ class SettingsDialog(QDialog):
     def _hotkey_tab(self):
         w = QWidget()
         grid = QGridLayout(w)
-        grid.addWidget(QLabel("입력란을 클릭한 뒤 원하는 키 조합을 누르세요."), 0, 0, 1, 3)
+        grid.addWidget(QLabel("입력란을 클릭한 뒤 원하는 키 조합을 누르세요. (Backspace: 지우기)\n"
+                              "Print Screen 키는 오른쪽 [PrtSc] 버튼으로도 지정할 수 있습니다."), 0, 0, 1, 4)
         self._key_edits = {}
         for row, mode in enumerate(MODES, start=1):
             grid.addWidget(QLabel(MODE_NAMES[mode]), row, 0)
-            ed = QKeySequenceEdit(QKeySequence(self.cfg.hotkey(mode), QKeySequence.SequenceFormat.PortableText))
-            try:
-                ed.setMaximumSequenceLength(1)
-            except AttributeError:
-                pass
+            ed = HotkeyEdit(self.cfg.hotkey(mode))
             grid.addWidget(ed, row, 1)
+            prt = QToolButton()
+            prt.setText("PrtSc")
+            prt.setObjectName("prtButton")
+            prt.setToolTip("Print Screen 키 지정")
+            prt.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            menu = QMenu(prt)
+            for s in PRINT_PRESETS:
+                menu.addAction(display_seq(s), lambda e=ed, s=s: self._set_print(e, s))
+            prt.setMenu(menu)
+            grid.addWidget(prt, row, 2)
             clear = QPushButton("지우기")
             clear.clicked.connect(ed.clear)
-            grid.addWidget(clear, row, 2)
+            grid.addWidget(clear, row, 3)
             self._key_edits[mode] = ed
         reset = QPushButton("기본값으로")
         reset.clicked.connect(self._reset_hotkeys)
-        grid.addWidget(reset, len(MODES) + 1, 2)
-        grid.setRowStretch(len(MODES) + 2, 1)
+        grid.addWidget(reset, len(MODES) + 1, 3)
+        note = QLabel("Print Screen 키를 눌렀을 때 Windows 캡처 도구가 대신 열리면, Windows 설정에서 "
+                      "'Print Screen 키를 사용하여 화면 캡처 열기'를 끄세요.")
+        note.setWordWrap(True)
+        note.setObjectName("hint")
+        grid.addWidget(note, len(MODES) + 2, 0, 1, 4)
+        open_win = QPushButton("Windows 키보드 설정 열기")
+        open_win.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("ms-settings:easeofaccess-keyboard")))
+        grid.addWidget(open_win, len(MODES) + 3, 0, 1, 2)
+        grid.setColumnStretch(1, 1)
+        grid.setRowStretch(len(MODES) + 4, 1)
         return w
+
+    def _set_print(self, ed, seq):
+        # 같은 키가 다른 기능에 있으면 그쪽을 비워 중복을 막는다
+        for other in self._key_edits.values():
+            if other is not ed and other.seq() == seq:
+                other.clear()
+        ed.set_seq(seq)
 
     def _save_tab(self):
         w = QWidget()
@@ -138,7 +234,7 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------ actions
     def _reset_hotkeys(self):
         for mode, ed in self._key_edits.items():
-            ed.setKeySequence(QKeySequence(DEFAULT_HOTKEYS[mode], QKeySequence.SequenceFormat.PortableText))
+            ed.set_seq(DEFAULT_HOTKEYS[mode])
 
     def _browse(self):
         d = QFileDialog.getExistingDirectory(self, "저장 폴더 선택", self.dir_edit.text())
@@ -148,9 +244,12 @@ class SettingsDialog(QDialog):
     def _accept(self):
         seqs = {}
         for mode, ed in self._key_edits.items():
-            s = ed.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
+            s = ed.seq()
             if s and not seq_to_win(s):
-                QMessageBox.warning(self, "단축키", f"[{MODE_NAMES[mode]}] '{s}' 는 사용할 수 없는 키입니다.")
+                QMessageBox.warning(self, "단축키", f"[{MODE_NAMES[mode]}] '{display_seq(s)}' 는 사용할 수 없는 키입니다.")
+                return
+            if s == "Alt+Print":
+                QMessageBox.warning(self, "단축키", "Alt+Print Screen 은 Windows 가 사용하는 키라 지정할 수 없습니다.")
                 return
             seqs[mode] = s
         used = [s for s in seqs.values() if s]
