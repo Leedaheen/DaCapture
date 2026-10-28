@@ -114,10 +114,21 @@ Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force
     ps1 = os.path.join(tempfile.gettempdir(), "DaCapture_update.ps1")
     with open(ps1, "w", encoding="utf-8-sig") as f:
         f.write(script)
-    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-    subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-                      "-File", ps1], creationflags=flags, close_fds=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", ps1]
+    # PyInstaller 실행 파일은 자식 프로세스를 Job 에 묶어 종료 시 함께 죽인다 -> Job 밖에서 실행해야 함
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    try:
+        subprocess.Popen(args, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    except OSError:
+        pass
+    # Job 이 분리를 허용하지 않으면 WMI 로 생성 (WMI 서비스가 만든 프로세스는 Job 에 속하지 않음)
+    cmd = subprocess.list2cmdline(args).replace("'", "''")
+    subprocess.run(["powershell.exe", "-NoProfile", "-Command",
+                    f"Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{cmd}'}}"],
+                   creationflags=subprocess.CREATE_NO_WINDOW, timeout=30,
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 class UpdateDialog(QDialog):
