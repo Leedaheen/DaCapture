@@ -128,6 +128,7 @@ class SettingsDialog(QDialog):
         lay.addWidget(self._check("general/magnifier", "영역 지정 시 돋보기 표시"))
         lay.addWidget(self._check("general/autostart", "Windows 시작 시 자동 실행"))
         lay.addWidget(self._check("general/start_tray", "시작할 때 트레이로 최소화"))
+        lay.addWidget(self._check("general/check_update", "새 버전이 나오면 알림 (업데이트 확인)"))
         lay.addStretch()
         return w
 

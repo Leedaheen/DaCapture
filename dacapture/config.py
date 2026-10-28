@@ -40,6 +40,8 @@ DEFAULTS = {
     "general/start_tray": False,
     "general/magnifier": True,
     "general/tray_notice_shown": False,
+    "general/check_update": True,
+    "general/skip_version": "",
     "save/auto": False,
     "save/dir": "",
     "save/format": "png",

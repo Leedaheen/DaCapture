@@ -10,7 +10,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QFileDialog, QGridLayout, QLabel, QMainWindow, QMenu,
                                QMessageBox, QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget)
 
-from . import APP_TITLE, __version__, grabber, icons, winapi
+from . import APP_TITLE, __version__, grabber, icons, updater, winapi
 from .config import MODE_NAMES, MODES, Config
 from .editor import EditorWindow
 from .hotkeys import HotkeyManager
@@ -134,7 +134,19 @@ class Controller(QObject):
         self._build_tray_menu()
         self.tray.setContextMenu(self.tray_menu)
         self.tray.activated.connect(self._tray_activated)
+        self._msg_action = None
+        self.tray.messageClicked.connect(self._message_clicked)
         self.tray.show()
+
+        self.update_dialog = None
+        self._manual_check = False
+        self.updater = updater.UpdateChecker(self)
+        self.updater.result.connect(self._update_result)
+        self._update_timer = QTimer(self)
+        self._update_timer.setInterval(6 * 60 * 60 * 1000)
+        self._update_timer.timeout.connect(self._auto_check_update)
+        self._update_timer.start()
+        QTimer.singleShot(5000, self._auto_check_update)
 
         self.hotkeys = HotkeyManager(self.capture)
         self.apply_hotkeys(initial=True)
@@ -169,18 +181,33 @@ class Controller(QObject):
         m.addSeparator()
         m.addAction(icons.icon("app"), "메인 창 보기", self.show_main)
         m.addAction(icons.icon("settings"), "환경 설정...", self.show_settings)
+        m.addAction("업데이트 확인", lambda: self.check_update(manual=True))
         m.addAction("정보", self.about)
         m.addSeparator()
         m.addAction("종료", self.quit)
+
+    def _auto_check_update(self):
+        if self.cfg.get("general/check_update"):
+            self.check_update(manual=False)
 
     def _tray_activated(self, reason):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
             self.show_main()
 
+    def notify(self, text, icon=QSystemTrayIcon.MessageIcon.Information, ms=4000, on_click=None):
+        """트레이 알림. on_click: 알림을 클릭했을 때 실행할 동작 (다음 알림이 뜨면 교체됨)"""
+        self._msg_action = on_click
+        self.tray.showMessage(APP_TITLE, text, icon, ms)
+
+    def _message_clicked(self):
+        action, self._msg_action = self._msg_action, None
+        if action:
+            action()
+
     def notify_tray_once(self):
         if not self.cfg.get("general/tray_notice_shown"):
             self.cfg.set("general/tray_notice_shown", True)
-            self.tray.showMessage(APP_TITLE, "트레이에서 계속 실행 중입니다. 단축키로 바로 캡처할 수 있습니다.",
+            self.notify("트레이에서 계속 실행 중입니다. 단축키로 바로 캡처할 수 있습니다.",
                                   QSystemTrayIcon.MessageIcon.Information, 4000)
 
     def apply_hotkeys(self, initial=False):
@@ -189,7 +216,7 @@ class Controller(QObject):
         self._build_tray_menu()
         if failed:
             names = ", ".join(f"{MODE_NAMES[m]}({s})" for m, s in failed)
-            self.tray.showMessage(APP_TITLE, f"단축키를 등록하지 못했습니다 (다른 프로그램이 사용 중): {names}",
+            self.notify(f"단축키를 등록하지 못했습니다 (다른 프로그램이 사용 중): {names}",
                                   QSystemTrayIcon.MessageIcon.Warning, 6000)
 
     # ------------------------------------------------------------ windows
@@ -245,7 +272,7 @@ class Controller(QObject):
     def edit_clipboard(self):
         img = QApplication.clipboard().image()
         if img.isNull():
-            self.tray.showMessage(APP_TITLE, "클립보드에 이미지가 없습니다.", QSystemTrayIcon.MessageIcon.Information,
+            self.notify("클립보드에 이미지가 없습니다.", QSystemTrayIcon.MessageIcon.Information,
                                   3000)
             return
         self.open_editor(img, "클립보드 이미지")
@@ -310,15 +337,17 @@ class Controller(QObject):
             out = img.convertToFormat(QImage.Format.Format_RGB32) if fmt != "PNG" else img
             if not out.save(saved, fmt, self.cfg.get("save/jpg_quality") if fmt == "JPG" else -1):
                 saved = None
+        title = f"{MODE_NAMES[mode]} 캡처"
         if self.cfg.get("general/open_editor"):
-            self.open_editor(img, f"{MODE_NAMES[mode]} 캡처", saved)
+            self.open_editor(img, title, saved)
         else:
             msg = f"{img.width()} x {img.height()} 캡처 완료"
             if saved:
                 msg += f"\n{saved}"
             elif self.cfg.get("general/copy_clipboard"):
                 msg += " (클립보드에 복사됨)"
-            self.tray.showMessage(APP_TITLE, msg, QSystemTrayIcon.MessageIcon.Information, 2500)
+            msg += "\n클릭하면 편집기에서 엽니다."
+            self.notify(msg, ms=5000, on_click=lambda: self.open_editor(img, title, saved))
 
     def _end(self):
         self.busy = False
@@ -326,14 +355,54 @@ class Controller(QObject):
             self.restore_main = False
             self.main.show()
 
-    def quit(self):
+    def quit(self, before_exit=None):
+        """편집기를 모두 닫고 종료. 사용자가 저장 확인에서 취소하면 False."""
         for ed in list(self.editors):
             ed.close()
             if ed.isVisible():
-                return
+                return False
+        if before_exit:
+            before_exit()
         self.hotkeys.unregister_all()
         self.tray.hide()
         self.app.quit()
+        return True
+
+    # ------------------------------------------------------------ update
+    def check_update(self, manual=False):
+        self._manual_check = manual
+        self.updater.check()
+
+    def _update_result(self, info, err):
+        manual = self._manual_check
+        if info is None:
+            if manual:
+                QMessageBox.warning(None, APP_TITLE, f"업데이트 정보를 가져오지 못했습니다.\n{err}")
+            return
+        if not updater.is_newer(info["version"]):
+            if manual:
+                QMessageBox.information(None, APP_TITLE, f"최신 버전({__version__})을 사용 중입니다.")
+            return
+        if not manual and info["version"] == self.cfg.get("general/skip_version"):
+            return
+        if self.update_dialog is not None:
+            return
+        if not manual:
+            self.notify(f"새 버전 {info['version']} 이(가) 있습니다. 클릭하면 업데이트합니다.",
+                        on_click=lambda: self._show_update(info))
+        self._show_update(info)
+
+    def _show_update(self, info):
+        if self.update_dialog is not None:
+            self.update_dialog.raise_()
+            self.update_dialog.activateWindow()
+            return
+        self.update_dialog = updater.UpdateDialog(info, self.cfg, self.quit)
+        self.update_dialog.finished.connect(lambda _: setattr(self, "update_dialog", None))
+        self.update_dialog.show()
+        self.update_dialog.raise_()
+        self.update_dialog.activateWindow()
+        winapi.force_foreground(int(self.update_dialog.winId()))
 
 
 def _forward_to_running(args):
@@ -380,6 +449,8 @@ def main():
         files = [a for a in argv if not a.startswith("--") and os.path.isfile(a)]
         for f in files:
             ctrl.open_path(f)
+        if "--updated" in argv:
+            ctrl.notify(f"{__version__} 버전으로 업데이트되었습니다.")
         for a in argv:
             if a.startswith("--capture="):
                 ctrl.capture(a.split("=", 1)[1])
