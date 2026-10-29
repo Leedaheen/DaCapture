@@ -356,8 +356,28 @@ def exclude_from_capture(hwnd):
         pass
 
 
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
+user32.BringWindowToTop.argtypes = [wt.HWND]
+user32.GetForegroundWindow.restype = wt.HWND
+
+
 def force_foreground(hwnd):
-    user32.SetForegroundWindow(hwnd)
+    """창을 앞으로 가져와 키보드 포커스를 준다.
+    저수준 훅으로 받은 단축키(Print Screen)는 입력이 이 프로세스로 오지 않아 SetForegroundWindow 가
+    거부되므로, 현재 전경 창의 스레드에 입력을 잠시 붙여 권한을 얻는다."""
+    fg = user32.GetForegroundWindow()
+    if fg == hwnd:
+        return
+    cur = _k32.GetCurrentThreadId()
+    fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    attached = bool(fg_tid and fg_tid != cur and user32.AttachThreadInput(cur, fg_tid, True))
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(cur, fg_tid, False)
 
 
 # ---------------------------------------------------------------- autostart

@@ -306,11 +306,14 @@ class Controller(QObject):
             self.overlay = CaptureOverlay(mode, self.cfg, shot, vrect, windows, self.uia)
             self.overlay.finished.connect(self._overlay_done)
             self.overlay.start()
+            self.hotkeys.set_escape(self.overlay.cancel)
         except Exception as ex:
+            self.hotkeys.set_escape(None)
             self._end()
             QMessageBox.critical(None, APP_TITLE, f"캡처 중 오류가 발생했습니다.\n{ex}")
 
     def _overlay_done(self, result):
+        self.hotkeys.set_escape(None)
         self.overlay = None
         if result is None:
             self._end()

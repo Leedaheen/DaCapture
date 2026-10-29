@@ -56,6 +56,7 @@ def seq_to_win(seq):
 
 
 VK_SNAPSHOT = 0x2C
+_ESC_ID = 0x7F00  # 캡처 화면용 ESC 단축키 id (모드 id 와 겹치지 않게)
 _WH_KEYBOARD_LL = 13
 _WM_KEYDOWN, _WM_KEYUP, _WM_SYSKEYDOWN, _WM_SYSKEYUP = 0x0100, 0x0101, 0x0104, 0x0105
 
@@ -160,7 +161,16 @@ class HotkeyManager(QAbstractNativeEventFilter):
         self._ids = {}
         self._registered = []   # RegisterHotKey 로 등록한 id
         self._prt_hook = None
+        self._esc_cb = None
         QCoreApplication.instance().installNativeEventFilter(self)
+
+    def set_escape(self, callback):
+        """캡처 화면이 떠 있는 동안 ESC 를 전역 단축키로 잡는다 (포커스가 없어도 취소되도록). None 이면 해제."""
+        if self._esc_cb is not None:
+            winapi.user32.UnregisterHotKey(self._hwnd, _ESC_ID)
+            self._esc_cb = None
+        if callback is not None and winapi.user32.RegisterHotKey(self._hwnd, _ESC_ID, 0, 0x1B):
+            self._esc_cb = callback
 
     def unregister_all(self):
         for hid in self._registered:
@@ -201,6 +211,11 @@ class HotkeyManager(QAbstractNativeEventFilter):
         if bytes(event_type) == b"windows_generic_MSG":
             msg = wt.MSG.from_address(int(message))
             if msg.message == winapi.WM_HOTKEY and (msg.hWnd or 0) == self._hwnd:
+                if int(msg.wParam) == _ESC_ID:
+                    cb = self._esc_cb
+                    if cb is not None:
+                        QTimer.singleShot(0, cb)
+                    return True, 0
                 mode = self._ids.get(int(msg.wParam))
                 if mode:
                     QTimer.singleShot(0, lambda m=mode: self.callback(m))
